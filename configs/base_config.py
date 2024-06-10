@@ -44,9 +44,9 @@ class BaseTrainingConfig:
     save_model_epochs = 50
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
     # output_dir = "cddpm-base-32"  # the model name locally and on the HF Hub
-    num_inference_steps = 100
+    num_inference_steps = 200
 
     overwrite_output_dir = False  # overwrite the old model when re-running the notebook
-    seed = 0
+    seed = 1
 
 

@@ -236,7 +236,7 @@ if __name__ == "__main__":
 
     ### create CEs of a given class from the image grid
     y = torch.full((x.shape[0], 1, 1), 5, dtype=torch.int).to(x.device)
-    x_ces = generate_ces(cfg, model, scheduler, x, y, n_ces=1, guidance=10, ce_sigma=0.2, calc_likelihood=False)
+    x_ces = generate_ces(cfg, model, scheduler, x, y, n_ces=1, guidance=15, ce_sigma=0.2, calc_likelihood=False)
     x_ces_npy = get_ims_npy(x_ces.squeeze())
     ces_images = []
     for x_elem in x_ces_npy:
@@ -262,23 +262,14 @@ if __name__ == "__main__":
     x_test = torch.cat(x_test)
     x_test_npy = get_ims_npy(x_test)
     x_test = x_test.cuda()
-    x_ces, ll_prereduce = generate_ces(cfg, model, scheduler, x_test, n_ces=5, guidance=10, ce_sigma=0.2, calc_likelihood=True)
+    x_ces, logits = generate_ces(cfg, model, scheduler, x_test, n_ces=3, guidance=15, ce_sigma=0.2, calc_likelihood=True)
 
     # prepare CEs for display
     x_ces_flat = x_ces.reshape((-1,) + x_ces.shape[-3:])
     x_ces_npy = np.reshape(get_ims_npy(x_ces_flat), x_ces.shape[:3] + x_ces.shape[-2:] + (x_ces.shape[3],))
 
     # prepare attributions for Display and yield reduced likelihoods
-    logits = ll_prereduce.sum(dim=(3, 4, 5)).mean(dim=2) # (batch_size, n_class)
     probs = F.softmax(logits, dim=1)
-    llsh = ll_prereduce.shape
-    ll_sc = ll_prereduce.mean(dim=(2, 3)) # average over n_ces & channel dimensions, so (batch_size, n_class, H, W)
-    ll_sc_max = ll_sc.view(llsh[:2] + (-1,)).max(dim=2)[0][:, :, None, None]
-    ll_sc_min = ll_sc.view(llsh[:2] + (-1,)).min(dim=2)[0][:, :, None, None]
-    # ll_sc = (ll_sc - ll_sc_min) / (ll_sc_max - ll_sc_min)
-    ll_sc = (ll_sc - ll_sc_max).exp() # in (0, 1]
-    ll_sc_flat = ll_sc.reshape((-1, 1) + llsh[-2:])
-    ll_sc_npy = np.reshape(get_ims_npy(ll_sc_flat), llsh[:2] + llsh[-2:])
     
     import matplotlib.pyplot as plt
 
@@ -298,21 +289,20 @@ if __name__ == "__main__":
 
     fig.savefig(f"{test_dir}/eval_ces.png")
 
-    import matplotlib.pyplot as plt
 
-    fig, axs = plt.subplots(nrows=n_test, ncols=1 + cfg.class_condition_dim)
+    # fig, axs = plt.subplots(nrows=n_test, ncols=1 + cfg.class_condition_dim)
 
-    for i in range(n_test):
-        axs[i][0].set_title("{}".format(y_test[i]))
-        axs[i][0].imshow(x_test_npy[i])
-        axs[i][0].xaxis.set_visible(False)
-        axs[i][0].yaxis.set_visible(False)
+    # for i in range(n_test):
+    #     axs[i][0].set_title("{}".format(y_test[i]))
+    #     axs[i][0].imshow(x_test_npy[i])
+    #     axs[i][0].xaxis.set_visible(False)
+    #     axs[i][0].yaxis.set_visible(False)
 
-        for j in range(cfg.class_condition_dim):
-            axs[i][j+1].set_title("{:1.2f}".format(probs[i][j]))
-            axs[i][j+1].imshow(ll_sc_npy[i][j])
-            axs[i][j+1].xaxis.set_visible(False)
-            axs[i][j+1].yaxis.set_visible(False)
+    #     for j in range(cfg.class_condition_dim):
+    #         axs[i][j+1].set_title("{:1.2f}".format(probs[i][j]))
+    #         axs[i][j+1].imshow(ll_sc_npy[i][j])
+    #         axs[i][j+1].xaxis.set_visible(False)
+    #         axs[i][j+1].yaxis.set_visible(False)
 
-    fig.savefig(f"{test_dir}/eval_ces_ll.png")
+    # fig.savefig(f"{test_dir}/eval_ces_ll.png")
     
