@@ -22,9 +22,9 @@ def get_ims_npy(x):
     return (x.clamp(0, 1).permute(0, 2, 3, 1) * 255).to(torch.uint8).cpu().numpy()
 
 
-def sample_with_guidance(config, model, scheduler, conds, guidance=5.):
+def sample_with_guidance(accelerator, config, model, scheduler, conds, guidance=5.):
     samples_shape = (len(conds), config.image_chan, config.image_size, config.image_size)
-    noise = torch.randn(samples_shape, device="cuda") * scheduler.init_noise_sigma
+    noise = torch.randn(samples_shape, device=accelerator.device) * scheduler.init_noise_sigma
 
     scheduler.set_timesteps(
             config.num_inference_steps
@@ -32,25 +32,37 @@ def sample_with_guidance(config, model, scheduler, conds, guidance=5.):
 
     z = noise
 
-    conds_guide = torch.cat([conds, torch.full_like(conds, config.class_condition_dim)])
+    inp_dict = dict(
+        z = z,
+        conds = conds
+    )
 
-    for t in scheduler.timesteps:
-        with torch.no_grad():
-            z_guide = scheduler.scale_model_input(torch.cat([z, z]), timestep=t)
-            noisy_residual = model(z_guide, t, class_labels=conds_guide).sample
-        pred_cond, pred_uncond = noisy_residual.chunk(2)
-        
-        pred = pred_cond + guidance * (pred_cond - pred_uncond)
-        z = scheduler.step(pred, t, z).prev_sample
+    print(z.shape, conds.shape)
+
+    with accelerator.split_between_processes(inp_dict, apply_padding=True) as inp:
+        z, conds = inp["z"], inp["conds"]
+        conds_guide = torch.cat([conds, torch.full_like(conds, config.class_condition_dim)])
+
+        for t in scheduler.timesteps:
+            with torch.no_grad():
+                z_guide = scheduler.scale_model_input(torch.cat([z, z]), timestep=t)
+                noisy_residual = model(z_guide, t, class_labels=conds_guide).sample
+            pred_cond, pred_uncond = noisy_residual.chunk(2)
+            
+            pred = pred_cond + guidance * (pred_cond - pred_uncond)
+            z = scheduler.step(pred, t, z).prev_sample
+
+    accelerator.wait_for_everyone()
+    z = accelerator.gather(z)[:samples_shape[0]]
 
     return z
 
-def evaluate(config, epoch, model, scheduler):
+def evaluate(accelerator, config, epoch, model, scheduler):
 
     # Sample some images from random noise (this is the backward diffusion process).
     # The default pipeline output type is `List[PIL.Image]`
     
-    x = sample_with_guidance(config, model, scheduler, torch.arange(16, device="cuda") % 10, guidance=5.)
+    x = sample_with_guidance(accelerator, config, model, scheduler, torch.arange(16, device="cuda") % 10, guidance=5.)
     x_npy = get_ims_npy(x)
     
     images = []
@@ -68,16 +80,7 @@ def evaluate(config, epoch, model, scheduler):
     image_grid.save(f"{test_dir}/{epoch:04d}.png")
 
 # from https://huggingface.co/docs/diffusers/en/tutorials/basic_training
-def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
-    
-
-    # Initialize accelerator and tensorboard logging
-    accelerator = Accelerator(
-        mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        log_with="tensorboard",
-        project_dir=os.path.join(config.output_dir, "logs"),
-    )
+def train_loop(accelerator: Accelerator, config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):    
 
     if accelerator.is_main_process:
 
@@ -95,7 +98,7 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
     # Now you train the model
     for epoch in range(config.num_epochs):
 
-        progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process or True)
+        progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
 
         for step, batch in enumerate(train_dataloader):
@@ -146,7 +149,7 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
             pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
 
             if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                evaluate(config, epoch, model, noise_scheduler)
+                evaluate(accelerator, config, epoch, model, noise_scheduler)
 
             if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
                 pipeline.save_pretrained(config.output_dir)
@@ -164,7 +167,16 @@ if __name__ == "__main__":
 
     parser.add_argument("--num_processes", type=int, default=1, help="number of processes for training. should be device count")
 
+    # eval args
+    parser.add_argument("--eval_n_ces", type=int, default=5, help="number of ces to generate during evaluation")
+    parser.add_argument("--eval_guidance", type=float, default=15.)
+    parser.add_argument("--eval_ce_sigma", type=float, default=0.2)
+    parser.add_argument("--eval_plot_ces", action="store_true")
+
     args = parser.parse_args()
+
+    # suppress userwarning
+    torch.backends.cudnn.enabled = False
 
     # select the config
     cfg = configs.utils.get_config(args.config)
@@ -173,6 +185,17 @@ if __name__ == "__main__":
     exp_path = cfg.output_dir
     if not os.path.exists(exp_path):
         os.makedirs(exp_path, exist_ok=True)
+
+    # set up the distributed state for parallel coordination
+    accelerator = Accelerator(
+        mixed_precision=cfg.mixed_precision,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+        log_with="tensorboard",
+        project_dir=os.path.join(cfg.output_dir, "logs"),
+    )
+
+    device = accelerator.device
+    dtype = accelerator.distributed_type
 
     # load in the dataset based on args
     train_dataset, test_dataset = configs.utils.get_dataset(cfg)
@@ -222,87 +245,76 @@ if __name__ == "__main__":
 
     # generate some samples as a sanity check
     
-    x = sample_with_guidance(cfg, model, scheduler, torch.arange(16, device="cuda") % 10, guidance=5.).squeeze()
-    x_npy = get_ims_npy(x)
-    images = []
-    for x_elem in x_npy:
-        images.append(Image.fromarray(x_elem))
-    # Make a grid out of the images
-    image_grid = make_image_grid(images, rows=4, cols=4)
-    # Save the images
-    test_dir = os.path.join(cfg.output_dir, "samples")
-    os.makedirs(test_dir, exist_ok=True)
-    image_grid.save(f"{test_dir}/eval_samples.png")
+    x = sample_with_guidance(accelerator, cfg, model, scheduler, torch.arange(16, device="cuda") % 10, guidance=5.).squeeze()
+    if accelerator.is_main_process:
+        x_npy = get_ims_npy(x)
+        images = []
+        for x_elem in x_npy:
+            images.append(Image.fromarray(x_elem))
+        # Make a grid out of the images
+        image_grid = make_image_grid(images, rows=4, cols=4)
+        # Save the images
+        test_dir = os.path.join(cfg.output_dir, "samples")
+        os.makedirs(test_dir, exist_ok=True)
+        image_grid.save(f"{test_dir}/eval_samples.png")
 
     ### create CEs of a given class from the image grid
     y = torch.full((x.shape[0], 1, 1), 5, dtype=torch.int).to(x.device)
-    x_ces = generate_ces(cfg, model, scheduler, x, y, n_ces=1, guidance=15, ce_sigma=0.2, calc_likelihood=False)
-    x_ces_npy = get_ims_npy(x_ces.squeeze())
-    ces_images = []
-    for x_elem in x_ces_npy:
-        ces_images.append(Image.fromarray(x_elem))
-    # Make a grid out of the images
-    image_grid = make_image_grid(ces_images, rows=4, cols=4)
-    # Save the images
-    test_dir = os.path.join(cfg.output_dir, "samples")
-    os.makedirs(test_dir, exist_ok=True)
-    image_grid.save(f"{test_dir}/eval_ce_samples.png")
-    print("Done Sampling.")
+    x_ces, logits = generate_ces(accelerator, cfg, model, scheduler, x, y, n_ces=1, guidance=15, ce_sigma=0.2, calc_likelihood=False)
+    if accelerator.is_main_process:
+        x_ces_npy = get_ims_npy(x_ces.squeeze())
+        ces_images = []
+        for x_elem in x_ces_npy:
+            ces_images.append(Image.fromarray(x_elem))
+        # Make a grid out of the images
+        image_grid = make_image_grid(ces_images, rows=4, cols=4)
+        # Save the images
+        test_dir = os.path.join(cfg.output_dir, "samples")
+        os.makedirs(test_dir, exist_ok=True)
+        image_grid.save(f"{test_dir}/eval_ce_samples.png")
+        print("Done Sampling.")
 
 
-    # Evaluate on Some Test Images
-    begin = 15
-    n_test = 5
-    x_test, y_test = [], []
-    for i in range(begin, begin+n_test):
-        x, y = test_dataset[i]
-        x_test.append(x[None, :, :, :])
-        y_test.append(y)
-    
-    x_test = torch.cat(x_test)
-    x_test_npy = get_ims_npy(x_test)
-    x_test = x_test.cuda()
-    x_ces, logits = generate_ces(cfg, model, scheduler, x_test, n_ces=3, guidance=15, ce_sigma=0.2, calc_likelihood=True)
+    # evaluate on some test images
 
-    # prepare CEs for display
-    x_ces_flat = x_ces.reshape((-1,) + x_ces.shape[-3:])
-    x_ces_npy = np.reshape(get_ims_npy(x_ces_flat), x_ces.shape[:3] + x_ces.shape[-2:] + (x_ces.shape[3],))
+    n_eval = 0.
+    correct = 0.
+    for batch in test_dataloader:
+        x, y = batch
+        x = x.to(device)
+        y = y.to(device)
+        bs = y.shape[0]
+        x_ces, logits = generate_ces(accelerator, cfg, model, scheduler, x, n_ces=args.eval_n_ces, guidance=args.eval_guidance, ce_sigma=args.eval_ce_sigma, calc_likelihood=True)
+        probs = F.softmax(logits, dim=1)
+        correct += (y == probs.max(dim=1)[1]).sum()
+        n_eval += bs
 
-    # prepare attributions for Display and yield reduced likelihoods
-    probs = F.softmax(logits, dim=1)
-    
-    import matplotlib.pyplot as plt
+        if n_eval > 0 and accelerator.is_local_main_process:
+            # pbar.set_description("Acc: {:1.2f}%".format((correct/n_eval)*100.))
+            print("Acc: {:1.2f}%".format((correct/n_eval)*100.))
 
-    fig, axs = plt.subplots(nrows=n_test, ncols=1 + cfg.class_condition_dim)
+            if args.eval_plot_ces:
+                # prepare CEs for display
+                x_ces_flat = x_ces.reshape((-1,) + x_ces.shape[-3:])
+                x_ces_npy = np.reshape(get_ims_npy(x_ces_flat), x_ces.shape[:3] + x_ces.shape[-2:] + (x_ces.shape[3],))
+                x_test_npy = get_ims_npy(x)
+                
+                import matplotlib.pyplot as plt
 
-    for i in range(n_test):
-        axs[i][0].set_title("{}".format(y_test[i]))
-        axs[i][0].imshow(x_test_npy[i])
-        axs[i][0].xaxis.set_visible(False)
-        axs[i][0].yaxis.set_visible(False)
+                fig, axs = plt.subplots(nrows=bs, ncols=1 + cfg.class_condition_dim)
 
-        for j in range(cfg.class_condition_dim):
-            axs[i][j+1].set_title("{:1.2f}".format(probs[i][j]))
-            axs[i][j+1].imshow(x_ces_npy[i][j][0])
-            axs[i][j+1].xaxis.set_visible(False)
-            axs[i][j+1].yaxis.set_visible(False)
+                for i in range(bs):
+                    axs[i][0].set_title("{}".format(y[i]))
+                    axs[i][0].imshow(x_test_npy[i])
+                    axs[i][0].xaxis.set_visible(False)
+                    axs[i][0].yaxis.set_visible(False)
 
-    fig.savefig(f"{test_dir}/eval_ces.png")
+                    for j in range(cfg.class_condition_dim):
+                        axs[i][j+1].set_title("{:1.2f}".format(probs[i][j]))
+                        axs[i][j+1].imshow(x_ces_npy[i][j][0])
+                        axs[i][j+1].xaxis.set_visible(False)
+                        axs[i][j+1].yaxis.set_visible(False)
 
+                fig.savefig(f"{test_dir}/eval_ces.png")
 
-    # fig, axs = plt.subplots(nrows=n_test, ncols=1 + cfg.class_condition_dim)
-
-    # for i in range(n_test):
-    #     axs[i][0].set_title("{}".format(y_test[i]))
-    #     axs[i][0].imshow(x_test_npy[i])
-    #     axs[i][0].xaxis.set_visible(False)
-    #     axs[i][0].yaxis.set_visible(False)
-
-    #     for j in range(cfg.class_condition_dim):
-    #         axs[i][j+1].set_title("{:1.2f}".format(probs[i][j]))
-    #         axs[i][j+1].imshow(ll_sc_npy[i][j])
-    #         axs[i][j+1].xaxis.set_visible(False)
-    #         axs[i][j+1].yaxis.set_visible(False)
-
-    # fig.savefig(f"{test_dir}/eval_ces_ll.png")
-    
+                

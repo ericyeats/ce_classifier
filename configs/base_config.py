@@ -35,7 +35,7 @@ class BaseTrainingConfig:
     # training and evaluation
     cond_drop_rate = 0.3 # condtion drop rate for classifier-free guidance
     train_batch_size = 128
-    eval_batch_size = 128
+    eval_batch_size = 10
     num_epochs = 200
     gradient_accumulation_steps = 1
     learning_rate = 1e-4
@@ -44,9 +44,9 @@ class BaseTrainingConfig:
     save_model_epochs = 50
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
     # output_dir = "cddpm-base-32"  # the model name locally and on the HF Hub
-    num_inference_steps = 200
+    num_inference_steps = 500
 
     overwrite_output_dir = False  # overwrite the old model when re-running the notebook
-    seed = 1
+    seed = 0
 
 
